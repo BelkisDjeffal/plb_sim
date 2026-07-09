@@ -1,0 +1,89 @@
+Metadata-Version: 2.1
+Name: procset
+Version: 1.0
+Summary: Toolkit to manage sets of closed intervals.
+Home-page: https://gitlab.inria.fr/bleuse/procset.py
+Author: Raphaël Bleuse
+Author-email: cs@research.bleuse.net
+License: LGPLv3
+Project-URL: Documentation, https://procset.rtfd.io/en/stable/
+Keywords: interval set,scheduling
+Platform: UNKNOWN
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Provides: interval_set
+Obsoletes: interval_set
+Provides-Extra: test
+Requires-Dist: coverage ; extra == 'test'
+Requires-Dist: pytest ; extra == 'test'
+Requires-Dist: pytest-cov ; extra == 'test'
+Requires-Dist: interval-set ; extra == 'test'
+
+==========
+procset.py
+==========
+
+Toolkit to manage sets of closed intervals.
+
+`procset` is a pure python module to manage sets of closed intervals. It can be
+used as a small python library to manage sets of resources, and is especially
+useful when writing schedulers.
+
+
+Features
+--------
+
+- Free Software: licensed under LGPLv3 (see `<LICENSE.rst>`_).
+- Pure Python module :)
+- Thoroughly tested!
+- Drop-in replacement for `interval_set` (see `intsetwrap.py
+  <src/intsetwrap.py>`_).
+
+
+Limitations
+-----------
+
+- The provided implementation target only Python 3 (I do not want to maintain
+  old stuff :P).
+- The intervals bounds have to be non-negative integers.
+
+
+Requirements
+------------
+
+- `setuptools>=34.4.0`
+
+
+Example use
+-----------
+
+What does it look like to use ``procset``?  Here is a simple example program:
+
+.. code:: python
+
+   from procset import ProcSet
+
+
+   free_cores = ProcSet((0, 7))  # I have 8 cores to work with
+
+   job_cores = ProcSet((2, 5))  # let's use some cores for a job
+   free_cores -= job_cores
+
+   print('remaining cores:', str(free_cores))
+
+
+And it looks like this when run:
+
+.. code:: bash
+
+   $ python example.py
+   remaining cores: 0-1 6-7
+
+

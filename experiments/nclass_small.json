@@ -1,0 +1,28 @@
+{
+  "name": "nclass_small",
+  "repetitions": 1,
+  "schedulers": ["round_robin", "least_loaded", "plb_nclass"],
+  "scenarios": [
+    {
+      "name": "d180_balanced_theta10",
+      "duration_s": 180,
+      "total_workers": 600,
+      "class_counts": [200, 200, 200],
+      "theta": 10
+    },
+    {
+      "name": "d180_skew_freemium_theta10",
+      "duration_s": 180,
+      "total_workers": 600,
+      "class_counts": [150, 150, 300],
+      "theta": 10
+    },
+    {
+      "name": "d120_skew_freemium_theta10",
+      "duration_s": 120,
+      "total_workers": 600,
+      "class_counts": [150, 150, 300],
+      "theta": 10
+    }
+  ]
+}

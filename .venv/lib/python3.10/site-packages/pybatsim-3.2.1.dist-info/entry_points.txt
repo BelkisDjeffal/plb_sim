@@ -1,0 +1,4 @@
+[console_scripts]
+pybatsim=batsim.cmds.launcher:main
+pybatsim-experiment=batsim.cmds.experiments:main
+

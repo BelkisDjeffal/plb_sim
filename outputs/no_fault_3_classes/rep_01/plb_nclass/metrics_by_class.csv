@@ -1,0 +1,4 @@
+class,jobs,avg_waiting_time_s,p95_waiting_time_s,avg_turnaround_time_s,p95_turnaround_time_s,avg_execution_time_s,p95_execution_time_s
+enterprise,200,0.0,0.0,20.528027,28.540085,20.528027,28.540085
+freemium,200,0.0,0.0,20.004475,29.074023,20.004475,29.074023
+premium,200,0.0,0.0,19.820247,28.586135,19.820247,28.586135
