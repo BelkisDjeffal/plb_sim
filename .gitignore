@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated simulation outputs
+outputs/
+outputs_query/
+results/
+figures/diagnostics/
+
+# Backups and archives
+_cleanup_backup/
+*.tar.gz
+*.zip
+*.bak
+*.backup
+*.before_terminal_sweep
+
+# Local machine files
+.DS_Store
+*.swp
+
+# Large local calibration artifacts
+data/calibration/*.csv
+data/calibration/*.json
