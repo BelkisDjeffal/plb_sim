@@ -40,3 +40,31 @@ query_sim/plots/plot_scheduler_campaign.py
 Goal:
 
 Test many N-class differentiated routing algorithms automatically, repeat the same scenarios for each scheduler, compute decision metrics, and rank algorithms.
+
+## Scheduler campaign pipeline
+
+Run the current automatic scheduler campaign:
+
+```bash
+cd /home/spirals/phd/experiments/plb_batsim
+PYTHONPATH=. python3 query_sim/campaigns/run_scheduler_campaign.py
+```
+
+Main generated tables:
+
+```text
+outputs_query/scheduler_campaign/class_latency_metrics.csv
+outputs_query/scheduler_campaign/class_concurrency_metrics.csv
+outputs_query/scheduler_campaign/replica_composition_metrics.csv
+outputs_query/scheduler_campaign/class_concentration_metrics.csv
+outputs_query/scheduler_campaign/decision_metrics.csv
+outputs_query/scheduler_campaign/capacity_equivalence_metrics.csv
+```
+
+Current baseline schedulers:
+
+```text
+round_robin
+least_loaded
+static_partition
+```

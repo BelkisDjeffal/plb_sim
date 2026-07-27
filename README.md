@@ -65,6 +65,37 @@ results/
 figures/diagnostics/
 _cleanup_backup/
 
+
+
+## Scheduler campaign
+
+The campaign runner executes the same scenario family for several schedulers and writes standard metric tables.
+
+```bash
+PYTHONPATH=. python3 query_sim/campaigns/run_scheduler_campaign.py
+```
+
+The first baseline set is:
+
+```text
+round_robin
+least_loaded
+static_partition
+```
+
+The existing `plb_nclass` policy is kept as a current candidate, not as a baseline.
+
+Main campaign outputs:
+
+```text
+outputs_query/scheduler_campaign/class_latency_metrics.csv
+outputs_query/scheduler_campaign/class_concurrency_metrics.csv
+outputs_query/scheduler_campaign/replica_composition_metrics.csv
+outputs_query/scheduler_campaign/class_concentration_metrics.csv
+outputs_query/scheduler_campaign/decision_metrics.csv
+outputs_query/scheduler_campaign/capacity_equivalence_metrics.csv
+```
+
 ## Current workflow
 
 Regenerate the current query-level terminal sweep:

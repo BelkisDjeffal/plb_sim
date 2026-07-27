@@ -52,7 +52,7 @@ SCENARIO = {
         "return_policy": "simple",
     },
 
-    "schedulers": ["round_robin", "least_loaded", "plb_nclass"],
+    "schedulers": ["round_robin", "least_loaded", "static_partition", "plb_nclass"],
 
     "faults": {
         "enabled": False,

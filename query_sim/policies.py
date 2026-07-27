@@ -4,7 +4,6 @@ from collections import Counter, defaultdict
 from math import floor
 from typing import Any
 
-from scenario import SCENARIO
 
 
 class BasePolicy:
@@ -300,11 +299,70 @@ class PLBNClassPolicy(BasePolicy):
         return event
 
 
+class StaticPartitionPolicy(BasePolicy):
+    name = "static_partition"
+
+    def __init__(self, scenario: dict[str, Any]):
+        super().__init__(scenario)
+        cfg = scenario.get("scheduler_config", {})
+        classes = list(cfg.get("class_order", scenario["workload"]["classes"]))
+        static_cfg = cfg.get("static_partition", {})
+        partitions = static_cfg.get("partitions")
+        if partitions:
+            self.partitions = {
+                cls: sorted({int(r) for r in partitions.get(cls, [])})
+                for cls in classes
+            }
+        else:
+            self.partitions = self._build_balanced_partitions(classes)
+        self.fallback = str(static_cfg.get("fallback", "least_loaded_all"))
+
+    def _build_balanced_partitions(self, classes: list[str]) -> dict[str, list[int]]:
+        partitions = {cls: [] for cls in classes}
+        if not classes:
+            return partitions
+        for replica in range(self.nb_replicas):
+            cls = classes[replica % len(classes)]
+            partitions[cls].append(replica)
+        return partitions
+
+    def _candidate_replicas(self, cls: str) -> list[int]:
+        candidates = self.partitions.get(cls, [])
+        if candidates:
+            return list(candidates)
+        if self.fallback == "least_loaded_all":
+            return list(range(self.nb_replicas))
+        raise ValueError(f"static partition has no replicas for class {cls}")
+
+    def assign_session(self, time_s: float, session_id: str, cls: str) -> dict[str, Any]:
+        candidates = self._candidate_replicas(cls)
+        replica = min(candidates, key=lambda r: (self.active_total[r], r))
+        self._register(session_id, cls, replica)
+        return {
+            "event": "assign",
+            "time_s": time_s,
+            "session_id": session_id,
+            "class": cls,
+            "replica": replica,
+            "action": "static_partition",
+            "source_pool": cls,
+            "target_pool": cls,
+            "reason": "least_loaded_static_partition",
+            "pool_sizes": {k: len(v) for k, v in self.partitions.items()},
+        }
+
+
+AVAILABLE_POLICIES = {
+    "round_robin": RoundRobinPolicy,
+    "least_loaded": LeastLoadedPolicy,
+    "static_partition": StaticPartitionPolicy,
+    "plb_nclass": PLBNClassPolicy,
+}
+
+
 def make_policy(name: str, scenario: dict[str, Any]):
-    if name == "round_robin":
-        return RoundRobinPolicy(scenario)
-    if name == "least_loaded":
-        return LeastLoadedPolicy(scenario)
-    if name == "plb_nclass":
-        return PLBNClassPolicy(scenario)
-    raise ValueError(f"unknown policy: {name}")
+    try:
+        return AVAILABLE_POLICIES[name](scenario)
+    except KeyError as exc:
+        choices = ", ".join(sorted(AVAILABLE_POLICIES))
+        raise ValueError(f"unknown policy: {name}. Available policies: {choices}") from exc
