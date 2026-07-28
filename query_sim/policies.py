@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from copy import deepcopy
 from math import floor
 from typing import Any
 
@@ -316,6 +317,8 @@ class StaticPartitionPolicy(BasePolicy):
         else:
             self.partitions = self._build_balanced_partitions(classes)
         self.fallback = str(static_cfg.get("fallback", "least_loaded_all"))
+        self.routing = str(static_cfg.get("routing", "round_robin"))
+        self.next_by_class = defaultdict(int)
 
     def _build_balanced_partitions(self, classes: list[str]) -> dict[str, list[int]]:
         partitions = {cls: [] for cls in classes}
@@ -334,9 +337,19 @@ class StaticPartitionPolicy(BasePolicy):
             return list(range(self.nb_replicas))
         raise ValueError(f"static partition has no replicas for class {cls}")
 
+    def _select_static_replica(self, cls: str, candidates: list[int]) -> tuple[int, str]:
+        if self.routing == "round_robin":
+            index = self.next_by_class[cls] % len(candidates)
+            self.next_by_class[cls] += 1
+            return int(candidates[index]), "round_robin_within_dedicated_partition"
+        if self.routing == "least_loaded":
+            replica = min(candidates, key=lambda r: (self.active_total[r], r))
+            return int(replica), "least_loaded_within_dedicated_partition"
+        raise ValueError(f"unknown static partition routing: {self.routing}")
+
     def assign_session(self, time_s: float, session_id: str, cls: str) -> dict[str, Any]:
         candidates = self._candidate_replicas(cls)
-        replica = min(candidates, key=lambda r: (self.active_total[r], r))
+        replica, reason = self._select_static_replica(cls, candidates)
         self._register(session_id, cls, replica)
         return {
             "event": "assign",
@@ -347,7 +360,7 @@ class StaticPartitionPolicy(BasePolicy):
             "action": "static_partition",
             "source_pool": cls,
             "target_pool": cls,
-            "reason": "least_loaded_static_partition",
+            "reason": reason,
             "pool_sizes": {k: len(v) for k, v in self.partitions.items()},
         }
 
@@ -360,9 +373,53 @@ AVAILABLE_POLICIES = {
 }
 
 
+def parse_static_split_name(name: str) -> tuple[int, ...] | None:
+    if not name.startswith("static_"):
+        return None
+    parts = name.removeprefix("static_").split("_")
+    if not parts or any(not part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def build_dedicated_partitions(nb_replicas: int, classes: list[str], split: tuple[int, ...]) -> dict[str, list[int]]:
+    if len(split) != len(classes):
+        raise ValueError(f"static split {split} does not match classes {classes}")
+    if any(value <= 0 for value in split):
+        raise ValueError(f"static split must allocate at least one replica per class: {split}")
+    if sum(split) != nb_replicas:
+        raise ValueError(f"static split {split} does not sum to K={nb_replicas}")
+
+    partitions: dict[str, list[int]] = {}
+    cursor = 0
+    for cls, count in zip(classes, split):
+        partitions[cls] = list(range(cursor, cursor + count))
+        cursor += count
+    return partitions
+
+
+def make_static_scenario(name: str, scenario: dict[str, Any], split: tuple[int, ...]) -> dict[str, Any]:
+    static_scenario = deepcopy(scenario)
+    cfg = static_scenario.setdefault("scheduler_config", {})
+    classes = list(cfg.get("class_order", static_scenario["workload"]["classes"]))
+    nb_replicas = int(static_scenario["platform"]["replicas"])
+    cfg["static_partition"] = {
+        "name": name,
+        "split": list(split),
+        "partitions": build_dedicated_partitions(nb_replicas, classes, split),
+        "routing": "round_robin",
+        "fallback": "error",
+    }
+    return static_scenario
+
+
 def make_policy(name: str, scenario: dict[str, Any]):
+    static_split = parse_static_split_name(name)
+    if static_split is not None:
+        return StaticPartitionPolicy(make_static_scenario(name, scenario, static_split))
+
     try:
         return AVAILABLE_POLICIES[name](scenario)
     except KeyError as exc:
-        choices = ", ".join(sorted(AVAILABLE_POLICIES))
+        choices = ", ".join(sorted([*AVAILABLE_POLICIES, "static_<split>"]))
         raise ValueError(f"unknown policy: {name}. Available policies: {choices}") from exc

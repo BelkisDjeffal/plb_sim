@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from scenario import SCENARIO  # noqa: E402
 from query_sim.latency_model import EmpiricalLatencyModel  # noqa: E402
-from query_sim.policies import AVAILABLE_POLICIES, make_policy  # noqa: E402
+from query_sim.policies import make_policy  # noqa: E402
 from query_sim.workload import generate_workload  # noqa: E402
 
 
@@ -213,7 +213,7 @@ def run_simulation(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", choices=sorted(AVAILABLE_POLICIES), required=True)
+    parser.add_argument("--policy", required=True)
     parser.add_argument("--calibration", default="data/calibration/q1_query_observations.csv")
     parser.add_argument("--outdir", default=None)
     parser.add_argument("--min-samples", type=int, default=20)

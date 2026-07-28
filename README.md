@@ -80,7 +80,7 @@ The first baseline set is:
 ```text
 round_robin
 least_loaded
-static_partition
+dedicated static partitions
 ```
 
 The existing `plb_nclass` policy is kept as a current candidate, not as a baseline.
@@ -93,7 +93,7 @@ outputs_query/scheduler_campaign/class_concurrency_metrics.csv
 outputs_query/scheduler_campaign/replica_composition_metrics.csv
 outputs_query/scheduler_campaign/class_concentration_metrics.csv
 outputs_query/scheduler_campaign/decision_metrics.csv
-outputs_query/scheduler_campaign/capacity_equivalence_metrics.csv
+outputs_query/scheduler_campaign/baseline_comparison_metrics.csv
 ```
 
 ## Current workflow

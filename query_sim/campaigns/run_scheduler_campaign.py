@@ -20,7 +20,10 @@ from query_sim.run_query_simulation import run_simulation  # noqa: E402
 DEFAULT_TERMINAL_LEVELS = [240, 300, 360, 480, 600, 800, 1000]
 DEFAULT_CLUSTER_SIZES = [8]
 DEFAULT_SEEDS = [42]
-DEFAULT_SCHEDULERS = ["round_robin", "least_loaded", "static_partition", "plb_nclass"]
+DEDICATED_STATIC_SPLITS_BY_K = {
+    8: [(6, 1, 1), (5, 2, 1), (4, 3, 1), (4, 2, 2)],
+}
+DEFAULT_SCHEDULERS = ["round_robin", "least_loaded", "dedicated_static", "plb_nclass"]
 DEFAULT_RATIOS = {
     "balanced": [1, 1, 1],
 }
@@ -85,7 +88,7 @@ def run_campaign(
                 for seed in seeds:
                     scenario = scenario_variant(SCENARIO, K, T, ratio_name, ratio_weights, seed)
                     counts = scenario["workload"]["class_counts"]
-                    for scheduler in schedulers:
+                    for scheduler in expand_schedulers_for_k(schedulers, K):
                         run_dir = outdir / f"K{K}" / f"T{T}" / f"ratio_{ratio_name}" / f"seed{seed}" / scheduler
                         print("=" * 80)
                         print(f"scheduler={scheduler} K={K} T={T} ratio={ratio_name} seed={seed} class_counts={counts}")
@@ -112,6 +115,34 @@ def parse_int_list(value: str) -> list[int]:
 
 def parse_scheduler_list(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
+
+
+
+def static_scheduler_name(split: tuple[int, ...]) -> str:
+    return "static_" + "_".join(str(value) for value in split)
+
+
+def expand_schedulers_for_k(schedulers: list[str], K: int) -> list[str]:
+    expanded: list[str] = []
+    for scheduler in schedulers:
+        if scheduler in {"dedicated_static", "static_dedicated"}:
+            splits = DEDICATED_STATIC_SPLITS_BY_K.get(int(K))
+            if not splits:
+                raise ValueError(
+                    f"no dedicated static split configured for K={K}. "
+                    "Add it to DEDICATED_STATIC_SPLITS_BY_K."
+                )
+            expanded.extend(static_scheduler_name(tuple(split)) for split in splits)
+        else:
+            expanded.append(scheduler)
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for scheduler in expanded:
+        if scheduler not in seen:
+            deduplicated.append(scheduler)
+            seen.add(scheduler)
+    return deduplicated
 
 
 def main() -> None:
