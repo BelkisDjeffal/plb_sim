@@ -120,6 +120,11 @@ def run_simulation(
             })
 
             query_id = f"q_{session_id}"
+            decision_metadata = {
+                key: value
+                for key, value in decision.items()
+                if key.startswith("replica_role_") or key.startswith("alloc_")
+            }
             heapq.heappush(event_queue, (
                 now + latency_s,
                 next(next_event_id),
@@ -136,6 +141,7 @@ def run_simulation(
                     "sample_load": sample_load,
                     "placement_action": decision.get("action", ""),
                     "placement_reason": decision.get("reason", ""),
+                    **decision_metadata,
                 },
             ))
 
@@ -155,16 +161,26 @@ def run_simulation(
             if release:
                 placement_events.append({**release, "policy": policy_name})
 
+            query_metadata = {
+                key: value
+                for key, value in payload.items()
+                if key.startswith("replica_role_") or key.startswith("alloc_")
+            }
             query_events.append({
                 "policy": policy_name,
+                "scheduler": policy_name,
                 "query_id": payload["query_id"],
                 "session_id": payload["session_id"],
                 "class": payload["class"],
                 "replica": replica,
+                "arrival_time_s": payload["query_start_s"],
+                "start_time_s": payload["query_start_s"],
+                "end_time_s": now,
                 "query_start_s": payload["query_start_s"],
                 "query_finish_s": now,
                 "latency_s": payload["latency_s"],
                 "q1_start_concurrency": payload["q1_start_concurrency"],
+                "local_concurrency_at_start": payload["q1_start_concurrency"],
                 "q1_end_concurrency": q1_end_concurrency,
                 "in_flight_at_start": payload["q1_start_concurrency"],
                 "in_flight_at_end": q1_end_concurrency,
@@ -172,6 +188,7 @@ def run_simulation(
                 "sample_load": payload["sample_load"],
                 "placement_action": payload["placement_action"],
                 "placement_reason": payload["placement_reason"],
+                **query_metadata,
             })
 
     query_csv = output_dir / "query_events.csv"
@@ -179,11 +196,15 @@ def run_simulation(
     placements_csv = output_dir / "session_placements.csv"
     active_csv = output_dir / "active_queries_timeseries.csv"
     metadata_json = output_dir / "run_metadata.json"
+    target_repair_csv = output_dir / "target_repair_decisions.csv"
 
     pd.DataFrame(query_events).to_csv(query_csv, index=False)
     write_metrics(query_events, metrics_csv)
     pd.DataFrame(placement_events).to_csv(placements_csv, index=False)
     pd.DataFrame(active_query_events).to_csv(active_csv, index=False)
+    if hasattr(policy, "target_repair_decisions"):
+        columns = getattr(policy, "target_repair_columns", None)
+        pd.DataFrame(policy.target_repair_decisions, columns=columns).to_csv(target_repair_csv, index=False)
 
     run_metadata = {
         "scenario_name": scenario_obj["name"],
@@ -202,13 +223,16 @@ def run_simulation(
         run_metadata.update(metadata)
     metadata_json.write_text(json.dumps(run_metadata, indent=2) + "\n")
 
-    return {
+    outputs = {
         "query_events": query_csv,
         "metrics_by_class": metrics_csv,
         "session_placements": placements_csv,
         "active_queries_timeseries": active_csv,
         "run_metadata": metadata_json,
     }
+    if target_repair_csv.exists():
+        outputs["target_repair_decisions"] = target_repair_csv
+    return outputs
 
 
 def main() -> None:

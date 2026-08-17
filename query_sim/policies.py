@@ -365,11 +365,423 @@ class StaticPartitionPolicy(BasePolicy):
         }
 
 
+class GlobalTargetRepairNeutralPolicy(BasePolicy):
+    name = "global_target_repair_neutral"
+    config_key = "global_target_repair_neutral"
+    classes = ["enterprise", "premium", "freemium"]
+    mixed_role = "mixed"
+    roles = ["enterprise", "premium", "freemium", "mixed"]
+    role_labels = {
+        "enterprise": "E",
+        "premium": "P",
+        "freemium": "F",
+        "mixed": "M",
+    }
+    target_repair_columns = [
+        "time",
+        "scheduler",
+        "reason",
+        "move_from",
+        "move_to",
+        "moved_replica",
+        "current_E",
+        "current_P",
+        "current_F",
+        "current_M",
+        "target_E",
+        "target_P",
+        "target_F",
+        "target_M",
+        "after_E",
+        "after_P",
+        "after_F",
+        "after_M",
+        "current_inv",
+        "target_inv",
+        "after_inv",
+        "target_balance",
+        "demand_E",
+        "demand_P",
+        "demand_F",
+    ]
+
+    def __init__(self, scenario: dict[str, Any]):
+        super().__init__(scenario)
+        cfg = scenario.get("scheduler_config", {})
+        repair_cfg = cfg.get(self.config_key, {})
+        self.classes = list(repair_cfg.get("class_order", cfg.get("class_order", self.classes)))
+        if self.classes != ["enterprise", "premium", "freemium"]:
+            raise ValueError(f"{self.name} currently expects enterprise,premium,freemium")
+        self.roles = [*self.classes, self.mixed_role]
+        self.control_period = float(repair_cfg.get("control_period", 1.0))
+        self.last_control_time: float | None = None
+        self.reference_alloc = self._load_reference_alloc(repair_cfg)
+        self.floors = {
+            cls: int(repair_cfg.get("floors", {}).get(cls, 1))
+            for cls in self.classes
+        }
+        self.role_of_replica = self._init_roles(repair_cfg)
+        self.target_repair_decisions: list[dict[str, Any]] = []
+
+    def _default_reference_alloc(self) -> dict[str, int]:
+        if self.nb_replicas == 8:
+            return {"enterprise": 1, "premium": 3, "freemium": 3, "mixed": 1}
+        if self.nb_replicas < len(self.classes):
+            raise ValueError("number of replicas must be at least the number of classes")
+        return {
+            "enterprise": 1,
+            "premium": 1,
+            "freemium": 1,
+            "mixed": self.nb_replicas - len(self.classes),
+        }
+
+    def _load_reference_alloc(self, repair_cfg: dict[str, Any]) -> dict[str, int]:
+        reference = self._default_reference_alloc()
+        reference.update({
+            role: int(value)
+            for role, value in repair_cfg.get("reference_alloc", {}).items()
+            if role in self.roles
+        })
+        total = sum(reference.get(role, 0) for role in self.roles)
+        if total != self.nb_replicas:
+            raise ValueError(f"reference allocation {reference} sums to {total}, not K={self.nb_replicas}")
+        return {role: int(reference.get(role, 0)) for role in self.roles}
+
+    def _init_roles(self, repair_cfg: dict[str, Any]) -> dict[int, str]:
+        explicit = repair_cfg.get("role_of_replica")
+        if explicit:
+            roles = {int(replica): str(role) for replica, role in explicit.items()}
+            if set(roles) != set(range(self.nb_replicas)):
+                raise ValueError("role_of_replica must define exactly one role for each replica")
+            if any(role not in self.roles for role in roles.values()):
+                raise ValueError(f"role_of_replica contains roles outside {self.roles}")
+            return roles
+
+        roles: dict[int, str] = {}
+        replica = 0
+        for role in self.roles:
+            for _ in range(self.reference_alloc[role]):
+                roles[replica] = role
+                replica += 1
+        return roles
+
+    def _alloc_counts(self) -> dict[str, int]:
+        counts = {role: 0 for role in self.roles}
+        for role in self.role_of_replica.values():
+            counts[role] += 1
+        return counts
+
+    def _demand(self) -> dict[str, int]:
+        counts = Counter(self.session_to_class.values())
+        return {cls: int(counts[cls]) for cls in self.classes}
+
+    def _active_classes(self, demand: dict[str, int]) -> list[str]:
+        return [cls for cls in self.classes if demand.get(cls, 0) > 0]
+
+    def _pressure(self, alloc: dict[str, int], demand: dict[str, int], cls: str) -> float:
+        return float(demand.get(cls, 0)) / float(max(1, alloc.get(cls, 0)))
+
+    def _inversion_cost(self, alloc: dict[str, int], demand: dict[str, int]) -> float:
+        active = self._active_classes(demand)
+        if len(active) < 2:
+            return 0.0
+        pressures = {cls: self._pressure(alloc, demand, cls) for cls in active}
+        cost = 0.0
+        for left, right in zip(active, active[1:]):
+            gap = max(0.0, pressures[left] - pressures[right])
+            cost += gap * gap
+        return float(cost)
+
+    def _balance_cost(self, alloc: dict[str, int], demand: dict[str, int]) -> float:
+        return float(sum(self._pressure(alloc, demand, cls) ** 2 for cls in self._active_classes(demand)))
+
+    def _distance(self, alloc: dict[str, int], current: dict[str, int]) -> int:
+        return int(sum(abs(int(alloc[role]) - int(current[role])) for role in self.roles))
+
+    def _feasible_allocations(self) -> list[dict[str, int]]:
+        allocations: list[dict[str, int]] = []
+        current: dict[str, int] = {}
+
+        def rec(index: int, remaining: int) -> None:
+            if index == len(self.classes):
+                alloc = dict(current)
+                alloc[self.mixed_role] = remaining
+                allocations.append({role: int(alloc.get(role, 0)) for role in self.roles})
+                return
+
+            cls = self.classes[index]
+            min_value = int(self.floors[cls])
+            remaining_floor = sum(int(self.floors[c]) for c in self.classes[index + 1:])
+            max_value = remaining - remaining_floor
+            for value in range(min_value, max_value + 1):
+                current[cls] = value
+                rec(index + 1, remaining - value)
+
+        rec(0, self.nb_replicas)
+        return allocations
+
+    def _target_alloc(self, current: dict[str, int], demand: dict[str, int]) -> dict[str, int]:
+        candidates = self._feasible_allocations()
+        return min(
+            candidates,
+            key=lambda alloc: (
+                self._inversion_cost(alloc, demand),
+                self._balance_cost(alloc, demand),
+                self._distance(alloc, current),
+                tuple(alloc[role] for role in self.roles),
+            ),
+        )
+
+    def _replicas_in_role(self, role: str) -> list[int]:
+        return sorted(replica for replica, value in self.role_of_replica.items() if value == role)
+
+    def _select_donor_replica(self, donor_role: str) -> int | None:
+        replicas = self._replicas_in_role(donor_role)
+        if not replicas:
+            return None
+        if donor_role == self.mixed_role:
+            return min(replicas, key=lambda r: (self.active_total[r], r))
+        return min(replicas, key=lambda r: (self.active_by_class[r][donor_role], self.active_total[r], r))
+
+    def _after_alloc(self, current: dict[str, int], donor: str, receiver: str) -> dict[str, int]:
+        alloc = dict(current)
+        alloc[donor] -= 1
+        alloc[receiver] += 1
+        return alloc
+
+    def _choose_priority_repair_move(
+        self,
+        current: dict[str, int],
+        target: dict[str, int],
+    ) -> tuple[str | None, str | None, str]:
+        receiver = None
+        for role in self.classes:
+            if current[role] < target[role]:
+                receiver = role
+                break
+        if receiver is None:
+            return None, None, "no_class_receiver_deficit"
+
+        for donor in [self.mixed_role, *reversed(self.classes)]:
+            if current[donor] > target[donor]:
+                return donor, receiver, "priority_repair"
+        return None, None, "no_donor_surplus"
+
+    def _choose_neutral_release_move(
+        self,
+        current: dict[str, int],
+        target: dict[str, int],
+        demand: dict[str, int],
+    ) -> tuple[str | None, str | None, str]:
+        if current[self.mixed_role] >= self.reference_alloc[self.mixed_role]:
+            return None, None, "no_move_priority_respected"
+
+        for donor in self.classes:
+            if current[donor] <= target[donor]:
+                continue
+            if current[donor] <= self.floors[donor]:
+                continue
+            after = self._after_alloc(current, donor, self.mixed_role)
+            if self._inversion_cost(after, demand) > 0.0:
+                continue
+            return donor, self.mixed_role, "neutral_release"
+
+        return None, None, "no_safe_neutral_release"
+
+    def _alloc_log_fields(self, prefix: str, alloc: dict[str, int]) -> dict[str, int]:
+        return {
+            f"{prefix}_{self.role_labels[role]}": int(alloc.get(role, 0))
+            for role in self.roles
+        }
+
+    def _demand_log_fields(self, demand: dict[str, int]) -> dict[str, int]:
+        return {
+            f"demand_{self.role_labels[cls]}": int(demand.get(cls, 0))
+            for cls in self.classes
+        }
+
+    def _record_control_decision(
+        self,
+        time_s: float,
+        reason: str,
+        move_from: str,
+        move_to: str,
+        moved_replica: int | str,
+        current: dict[str, int],
+        target: dict[str, int],
+        after: dict[str, int],
+        demand: dict[str, int],
+    ) -> None:
+        row: dict[str, Any] = {
+            "time": float(time_s),
+            "scheduler": self.name,
+            "reason": reason,
+            "move_from": move_from,
+            "move_to": move_to,
+            "moved_replica": moved_replica,
+            "current_inv": self._inversion_cost(current, demand),
+            "target_inv": self._inversion_cost(target, demand),
+            "after_inv": self._inversion_cost(after, demand),
+            "target_balance": self._balance_cost(target, demand),
+        }
+        row.update(self._alloc_log_fields("current", current))
+        row.update(self._alloc_log_fields("target", target))
+        row.update(self._alloc_log_fields("after", after))
+        row.update(self._demand_log_fields(demand))
+        self.target_repair_decisions.append({column: row.get(column, "") for column in self.target_repair_columns})
+
+    def _run_controller(self, time_s: float) -> None:
+        current = self._alloc_counts()
+        demand = self._demand()
+        target = self._target_alloc(current, demand)
+        current_inv = self._inversion_cost(current, demand)
+
+        if current_inv > 0.0:
+            donor, receiver, reason = self._choose_priority_repair_move(current, target)
+        else:
+            donor, receiver, reason = self._choose_neutral_release_move(current, target, demand)
+
+        moved_replica: int | str = ""
+        after = dict(current)
+        if donor is not None and receiver is not None:
+            replica = self._select_donor_replica(donor)
+            if replica is None:
+                reason = "no_physical_donor"
+            else:
+                self.role_of_replica[replica] = receiver
+                moved_replica = replica
+                after = self._after_alloc(current, donor, receiver)
+
+        self._record_control_decision(
+            time_s=time_s,
+            reason=reason,
+            move_from=donor or "",
+            move_to=receiver or "",
+            moved_replica=moved_replica,
+            current=current,
+            target=target,
+            after=after,
+            demand=demand,
+        )
+
+    def _maybe_run_controller(self, time_s: float) -> None:
+        if self.last_control_time is None or time_s - self.last_control_time >= self.control_period:
+            self._run_controller(time_s)
+            self.last_control_time = time_s
+
+    def _assignment_metadata(self, replica: int) -> dict[str, Any]:
+        alloc = self._alloc_counts()
+        data: dict[str, Any] = {
+            "replica_role_at_start": self.role_of_replica.get(int(replica), "unknown"),
+        }
+        for role in self.roles:
+            data[f"alloc_{self.role_labels[role]}_at_start"] = int(alloc.get(role, 0))
+        return data
+
+    def assign_session(self, time_s: float, session_id: str, cls: str) -> dict[str, Any]:
+        self._maybe_run_controller(time_s)
+        if cls not in self.classes:
+            cls = self.classes[-1]
+
+        candidates = self._replicas_in_role(cls)
+        if candidates:
+            replica = min(candidates, key=lambda r: (self.active_total[r], self.active_by_class[r][cls], r))
+            action = "target_repair_route"
+            reason = "least_loaded_role_replica"
+            source_pool = cls
+            target_pool = cls
+        else:
+            replica = min(range(self.nb_replicas), key=lambda r: (self.active_total[r], r))
+            action = "target_repair_fallback_global"
+            reason = "no_replica_with_class_role"
+            source_pool = self.role_of_replica.get(replica, "unknown")
+            target_pool = cls
+
+        self._register(session_id, cls, replica)
+        return {
+            "event": "assign",
+            "time_s": time_s,
+            "session_id": session_id,
+            "class": cls,
+            "replica": replica,
+            "action": action,
+            "source_pool": source_pool,
+            "target_pool": target_pool,
+            "reason": reason,
+            "pool_sizes": self._alloc_counts(),
+            **self._assignment_metadata(replica),
+        }
+
+
+class GlobalTargetRepairTargetOnlyPolicy(GlobalTargetRepairNeutralPolicy):
+    name = "global_target_repair_target_only"
+    config_key = "global_target_repair_target_only"
+
+    def _choose_neutral_release_move(
+        self,
+        current: dict[str, int],
+        target: dict[str, int],
+        demand: dict[str, int],
+    ) -> tuple[str | None, str | None, str]:
+        current_distance = self._distance(current, target)
+
+        def safe_move(donor: str, receiver: str) -> bool:
+            after = self._after_alloc(current, donor, receiver)
+            return (
+                self._inversion_cost(after, demand) == 0.0
+                and self._distance(after, target) < current_distance
+            )
+
+        if current[self.mixed_role] > target[self.mixed_role]:
+            for receiver in self.classes:
+                if current[receiver] >= target[receiver]:
+                    continue
+                if safe_move(self.mixed_role, receiver):
+                    return self.mixed_role, receiver, "neutral_fill_from_mixed"
+
+        if current[self.mixed_role] < target[self.mixed_role]:
+            for donor in reversed(self.classes):
+                if current[donor] <= target[donor]:
+                    continue
+                if current[donor] <= self.floors[donor]:
+                    continue
+                if safe_move(donor, self.mixed_role):
+                    return donor, self.mixed_role, "neutral_release_to_target"
+
+        if current == target:
+            return None, None, "no_move_at_target"
+        return None, None, "no_safe_target_move"
+
+
+class GlobalTargetRepairNeutralInit422Policy(GlobalTargetRepairNeutralPolicy):
+    name = "global_target_repair_neutral_init_4_2_2"
+    config_key = "global_target_repair_neutral_init_4_2_2"
+
+    def _default_reference_alloc(self) -> dict[str, int]:
+        if self.nb_replicas == 8:
+            return {"enterprise": 4, "premium": 2, "freemium": 2, "mixed": 0}
+        return super()._default_reference_alloc()
+
+
+class GlobalTargetRepairTargetOnlyInit422Policy(GlobalTargetRepairTargetOnlyPolicy):
+    name = "global_target_repair_target_only_init_4_2_2"
+    config_key = "global_target_repair_target_only_init_4_2_2"
+
+    def _default_reference_alloc(self) -> dict[str, int]:
+        if self.nb_replicas == 8:
+            return {"enterprise": 4, "premium": 2, "freemium": 2, "mixed": 0}
+        return super()._default_reference_alloc()
+
+
 AVAILABLE_POLICIES = {
     "round_robin": RoundRobinPolicy,
     "least_loaded": LeastLoadedPolicy,
     "static_partition": StaticPartitionPolicy,
     "plb_nclass": PLBNClassPolicy,
+    "global_target_repair_neutral": GlobalTargetRepairNeutralPolicy,
+    "global_target_repair_target_only": GlobalTargetRepairTargetOnlyPolicy,
+    "global_target_repair_neutral_init_4_2_2": GlobalTargetRepairNeutralInit422Policy,
+    "global_target_repair_target_only_init_4_2_2": GlobalTargetRepairTargetOnlyInit422Policy,
 }
 
 

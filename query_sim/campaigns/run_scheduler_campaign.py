@@ -23,9 +23,21 @@ DEFAULT_SEEDS = [42]
 DEDICATED_STATIC_SPLITS_BY_K = {
     8: [(6, 1, 1), (5, 2, 1), (4, 3, 1), (4, 2, 2)],
 }
-DEFAULT_SCHEDULERS = ["round_robin", "least_loaded", "dedicated_static", "plb_nclass"]
+DEFAULT_SCHEDULERS = [
+    "round_robin",
+    "least_loaded",
+    "dedicated_static",
+    "plb_nclass",
+    "global_target_repair_neutral",
+    "global_target_repair_target_only",
+    "global_target_repair_neutral_init_4_2_2",
+    "global_target_repair_target_only_init_4_2_2",
+]
 DEFAULT_RATIOS = {
     "balanced": [1, 1, 1],
+    "enterprise_heavy": [3, 1, 1],
+    "premium_heavy": [1, 3, 1],
+    "freemium_heavy": [1, 1, 3],
 }
 
 
@@ -117,6 +129,37 @@ def parse_scheduler_list(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def parse_ratio_weights(value: str) -> list[int]:
+    parts = value.replace(":", ",").split(",")
+    weights = [int(part.strip()) for part in parts if part.strip()]
+    if not weights:
+        raise ValueError("ratio weights must not be empty")
+    return weights
+
+
+def parse_ratio_list(value: str) -> dict[str, list[int]]:
+    selected: dict[str, list[int]] = {}
+
+    for item in [part.strip() for part in value.split(",") if part.strip()]:
+        if "=" in item:
+            name, weights_text = item.split("=", 1)
+            name = name.strip()
+            if not name:
+                raise ValueError("custom ratio name must not be empty")
+            selected[name] = parse_ratio_weights(weights_text)
+        elif item in DEFAULT_RATIOS:
+            selected[item] = DEFAULT_RATIOS[item]
+        else:
+            known = ", ".join(DEFAULT_RATIOS)
+            raise ValueError(
+                f"unknown ratio '{item}'. Use one of: {known}; "
+                "or define a custom ratio as name=w1:w2:w3."
+            )
+
+    if not selected:
+        raise ValueError("at least one ratio must be selected")
+    return selected
+
 
 def static_scheduler_name(split: tuple[int, ...]) -> str:
     return "static_" + "_".join(str(value) for value in split)
@@ -152,6 +195,7 @@ def main() -> None:
     parser.add_argument("--cluster-sizes", default=",".join(map(str, DEFAULT_CLUSTER_SIZES)))
     parser.add_argument("--seeds", default=",".join(map(str, DEFAULT_SEEDS)))
     parser.add_argument("--schedulers", default=",".join(DEFAULT_SCHEDULERS))
+    parser.add_argument("--ratios", default="balanced")
     parser.add_argument("--calibration", default="data/calibration/q1_query_observations.csv")
     parser.add_argument("--min-samples", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
@@ -163,7 +207,7 @@ def main() -> None:
         cluster_sizes=parse_int_list(args.cluster_sizes),
         seeds=parse_int_list(args.seeds),
         schedulers=parse_scheduler_list(args.schedulers),
-        ratios=DEFAULT_RATIOS,
+        ratios=parse_ratio_list(args.ratios),
         calibration=args.calibration,
         min_samples=args.min_samples,
         clean=not args.keep_existing,
