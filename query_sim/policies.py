@@ -753,6 +753,539 @@ class GlobalTargetRepairTargetOnlyPolicy(GlobalTargetRepairNeutralPolicy):
         return None, None, "no_safe_target_move"
 
 
+class GlobalTargetRepairNoMixedPolicy(BasePolicy):
+    name = "global_target_repair_nomixed"
+    config_key = "global_target_repair_nomixed"
+    classes = ["enterprise", "premium", "freemium"]
+    role_labels = {
+        "enterprise": "E",
+        "premium": "P",
+        "freemium": "F",
+    }
+    target_repair_columns = [
+        "time",
+        "scheduler",
+        "reason",
+        "move_from",
+        "move_to",
+        "moved_replica",
+        "current_E",
+        "current_P",
+        "current_F",
+        "target_E",
+        "target_P",
+        "target_F",
+        "after_E",
+        "after_P",
+        "after_F",
+        "current_inv",
+        "target_inv",
+        "after_inv",
+        "target_l1_distance",
+        "target_moves_required",
+        "after_l1_distance",
+        "demand_E",
+        "demand_P",
+        "demand_F",
+    ]
+
+    def __init__(self, scenario: dict[str, Any]):
+        super().__init__(scenario)
+        cfg = scenario.get("scheduler_config", {})
+        repair_cfg = cfg.get(self.config_key, {})
+        self.classes = list(repair_cfg.get("class_order", cfg.get("class_order", self.classes)))
+        if self.classes != ["enterprise", "premium", "freemium"]:
+            raise ValueError(f"{self.name} currently expects enterprise,premium,freemium")
+
+        self.control_period = float(repair_cfg.get("control_period", 1.0))
+        if self.control_period <= 0.0:
+            raise ValueError("control_period must be positive")
+        self.last_control_time: float | None = None
+
+        self.floors = {
+            cls: int(repair_cfg.get("floors", {}).get(cls, 1))
+            for cls in self.classes
+        }
+        if any(value < 1 for value in self.floors.values()):
+            raise ValueError("global_target_repair_nomixed requires floor >= 1 for every class")
+        if sum(self.floors.values()) > self.nb_replicas:
+            raise ValueError(f"floors {self.floors} exceed K={self.nb_replicas}")
+
+        self.initial_alloc = self._load_initial_alloc(repair_cfg)
+        self.role_of_replica = self._init_roles(repair_cfg)
+        self.target_repair_decisions: list[dict[str, Any]] = []
+
+    def _default_initial_alloc(self) -> dict[str, int]:
+        if self.nb_replicas == 8:
+            return {"enterprise": 4, "premium": 3, "freemium": 1}
+
+        weights = {"enterprise": 4, "premium": 3, "freemium": 1}
+        weight_sum = sum(weights.values())
+        raw = {cls: self.nb_replicas * weights[cls] / weight_sum for cls in self.classes}
+        alloc = {cls: int(floor(raw[cls])) for cls in self.classes}
+        remaining = self.nb_replicas - sum(alloc.values())
+        order = sorted(
+            self.classes,
+            key=lambda cls: (raw[cls] - alloc[cls], -self.classes.index(cls)),
+            reverse=True,
+        )
+        for cls in order[:remaining]:
+            alloc[cls] += 1
+
+        for cls in reversed(self.classes):
+            while alloc[cls] < self.floors[cls]:
+                donors = [
+                    donor
+                    for donor in reversed(self.classes)
+                    if donor != cls and alloc[donor] > self.floors[donor]
+                ]
+                if not donors:
+                    raise ValueError("cannot construct initial allocation satisfying floors")
+                alloc[donors[0]] -= 1
+                alloc[cls] += 1
+        return alloc
+
+    def _load_initial_alloc(self, repair_cfg: dict[str, Any]) -> dict[str, int]:
+        initial = self._default_initial_alloc()
+        initial.update({
+            cls: int(value)
+            for cls, value in repair_cfg.get("initial_alloc", {}).items()
+            if cls in self.classes
+        })
+        total = sum(initial.get(cls, 0) for cls in self.classes)
+        if total != self.nb_replicas:
+            raise ValueError(f"initial allocation {initial} sums to {total}, not K={self.nb_replicas}")
+        for cls in self.classes:
+            if initial[cls] < self.floors[cls]:
+                raise ValueError(
+                    f"initial allocation for {cls} is {initial[cls]}, below floor {self.floors[cls]}"
+                )
+        return {cls: int(initial[cls]) for cls in self.classes}
+
+    def _init_roles(self, repair_cfg: dict[str, Any]) -> dict[int, str]:
+        explicit = repair_cfg.get("role_of_replica")
+        if explicit:
+            roles = {int(replica): str(role) for replica, role in explicit.items()}
+            if set(roles) != set(range(self.nb_replicas)):
+                raise ValueError("role_of_replica must define exactly one role for each replica")
+            if any(role not in self.classes for role in roles.values()):
+                raise ValueError(f"role_of_replica contains roles outside {self.classes}")
+            counts = Counter(roles.values())
+            for cls in self.classes:
+                if counts[cls] < self.floors[cls]:
+                    raise ValueError(f"role_of_replica places {cls} below its floor")
+            return roles
+
+        roles: dict[int, str] = {}
+        replica = 0
+        for cls in self.classes:
+            for _ in range(self.initial_alloc[cls]):
+                roles[replica] = cls
+                replica += 1
+        return roles
+
+    def _alloc_counts(self) -> dict[str, int]:
+        counts = {cls: 0 for cls in self.classes}
+        for role in self.role_of_replica.values():
+            counts[role] += 1
+        return counts
+
+    def _demand(self) -> dict[str, int]:
+        counts = Counter(self.session_to_class.values())
+        return {cls: int(counts[cls]) for cls in self.classes}
+
+    def _active_classes(self, demand: dict[str, int]) -> list[str]:
+        return [cls for cls in self.classes if demand.get(cls, 0) > 0]
+
+    def _pressure(self, alloc: dict[str, int], demand: dict[str, int], cls: str) -> float:
+        return float(demand.get(cls, 0)) / float(alloc[cls])
+
+    def _inversion_cost(self, alloc: dict[str, int], demand: dict[str, int]) -> float:
+        active = self._active_classes(demand)
+        if len(active) < 2:
+            return 0.0
+        pressures = {cls: self._pressure(alloc, demand, cls) for cls in active}
+        cost = 0.0
+        for left, right in zip(active, active[1:]):
+            gap = max(0.0, pressures[left] - pressures[right])
+            cost += gap * gap
+        return float(cost)
+
+    def _distance(self, alloc: dict[str, int], other: dict[str, int]) -> int:
+        return int(sum(abs(int(alloc[cls]) - int(other[cls])) for cls in self.classes))
+
+    def _feasible_allocations(self) -> list[dict[str, int]]:
+        allocations: list[dict[str, int]] = []
+        current: dict[str, int] = {}
+
+        def rec(index: int, remaining: int) -> None:
+            if index == len(self.classes) - 1:
+                cls = self.classes[index]
+                if remaining >= self.floors[cls]:
+                    current[cls] = remaining
+                    allocations.append({c: int(current[c]) for c in self.classes})
+                return
+
+            cls = self.classes[index]
+            remaining_floor = sum(self.floors[c] for c in self.classes[index + 1:])
+            max_value = remaining - remaining_floor
+            for value in range(self.floors[cls], max_value + 1):
+                current[cls] = value
+                rec(index + 1, remaining - value)
+
+        rec(0, self.nb_replicas)
+        return allocations
+
+    def _target_alloc(self, current: dict[str, int], demand: dict[str, int]) -> dict[str, int]:
+        return min(
+            self._feasible_allocations(),
+            key=lambda alloc: (
+                self._inversion_cost(alloc, demand),
+                self._distance(alloc, current),
+                tuple(-int(alloc[cls]) for cls in self.classes),
+            ),
+        )
+
+    def _replicas_in_role(self, role: str) -> list[int]:
+        return sorted(replica for replica, value in self.role_of_replica.items() if value == role)
+
+    def _select_donor_replica(self, donor_role: str) -> int | None:
+        replicas = self._replicas_in_role(donor_role)
+        if not replicas:
+            return None
+        return min(
+            replicas,
+            key=lambda replica: (
+                self.active_by_class[replica][donor_role],
+                self.active_total[replica],
+                replica,
+            ),
+        )
+
+    def _after_alloc(self, current: dict[str, int], donor: str, receiver: str) -> dict[str, int]:
+        alloc = dict(current)
+        alloc[donor] -= 1
+        alloc[receiver] += 1
+        return alloc
+
+    def _choose_repair_move(
+        self,
+        current: dict[str, int],
+        target: dict[str, int],
+    ) -> tuple[str | None, str | None, str]:
+        receiver = next(
+            (cls for cls in self.classes if current[cls] < target[cls]),
+            None,
+        )
+        if receiver is None:
+            return None, None, "no_receiver_deficit"
+
+        donor = next(
+            (
+                cls
+                for cls in reversed(self.classes)
+                if current[cls] > target[cls] and current[cls] > self.floors[cls]
+            ),
+            None,
+        )
+        if donor is None:
+            return None, None, "no_donor_surplus"
+        return donor, receiver, "repair_toward_target"
+
+    def _alloc_log_fields(self, prefix: str, alloc: dict[str, int]) -> dict[str, int]:
+        return {
+            f"{prefix}_{self.role_labels[cls]}": int(alloc[cls])
+            for cls in self.classes
+        }
+
+    def _demand_log_fields(self, demand: dict[str, int]) -> dict[str, int]:
+        return {
+            f"demand_{self.role_labels[cls]}": int(demand.get(cls, 0))
+            for cls in self.classes
+        }
+
+    def _record_control_decision(
+        self,
+        time_s: float,
+        reason: str,
+        move_from: str,
+        move_to: str,
+        moved_replica: int | str,
+        current: dict[str, int],
+        target: dict[str, int],
+        after: dict[str, int],
+        demand: dict[str, int],
+    ) -> None:
+        target_l1_distance = self._distance(current, target)
+        row: dict[str, Any] = {
+            "time": float(time_s),
+            "scheduler": self.name,
+            "reason": reason,
+            "move_from": move_from,
+            "move_to": move_to,
+            "moved_replica": moved_replica,
+            "current_inv": self._inversion_cost(current, demand),
+            "target_inv": self._inversion_cost(target, demand),
+            "after_inv": self._inversion_cost(after, demand),
+            "target_l1_distance": target_l1_distance,
+            "target_moves_required": target_l1_distance // 2,
+            "after_l1_distance": self._distance(after, target),
+        }
+        row.update(self._alloc_log_fields("current", current))
+        row.update(self._alloc_log_fields("target", target))
+        row.update(self._alloc_log_fields("after", after))
+        row.update(self._demand_log_fields(demand))
+        self.target_repair_decisions.append({column: row.get(column, "") for column in self.target_repair_columns})
+
+    def _run_controller(self, time_s: float) -> None:
+        current = self._alloc_counts()
+        demand = self._demand()
+        target = self._target_alloc(current, demand)
+
+        donor: str | None = None
+        receiver: str | None = None
+        if current == target:
+            reason = "no_move_at_target"
+        else:
+            donor, receiver, reason = self._choose_repair_move(current, target)
+
+        moved_replica: int | str = ""
+        after = dict(current)
+        if donor is not None and receiver is not None:
+            replica = self._select_donor_replica(donor)
+            if replica is None:
+                reason = "no_physical_donor"
+            else:
+                self.role_of_replica[replica] = receiver
+                moved_replica = replica
+                after = self._after_alloc(current, donor, receiver)
+
+        self._record_control_decision(
+            time_s=time_s,
+            reason=reason,
+            move_from=donor or "",
+            move_to=receiver or "",
+            moved_replica=moved_replica,
+            current=current,
+            target=target,
+            after=after,
+            demand=demand,
+        )
+
+    def _maybe_run_controller(self, time_s: float) -> None:
+        if self.last_control_time is None or time_s - self.last_control_time >= self.control_period:
+            self._run_controller(time_s)
+            self.last_control_time = time_s
+
+    def _assignment_metadata(self, replica: int) -> dict[str, Any]:
+        alloc = self._alloc_counts()
+        data: dict[str, Any] = {
+            "replica_role_at_start": self.role_of_replica.get(int(replica), "unknown"),
+        }
+        for cls in self.classes:
+            data[f"alloc_{self.role_labels[cls]}_at_start"] = int(alloc[cls])
+        return data
+
+    def assign_session(self, time_s: float, session_id: str, cls: str) -> dict[str, Any]:
+        self._maybe_run_controller(time_s)
+        if cls not in self.classes:
+            cls = self.classes[-1]
+
+        candidates = self._replicas_in_role(cls)
+        if candidates:
+            replica = min(
+                candidates,
+                key=lambda r: (self.active_total[r], self.active_by_class[r][cls], r),
+            )
+            action = "target_repair_nomixed_route"
+            reason = "least_loaded_role_replica"
+            source_pool = cls
+            target_pool = cls
+        else:
+            replica = min(range(self.nb_replicas), key=lambda r: (self.active_total[r], r))
+            action = "target_repair_nomixed_fallback_global"
+            reason = "no_replica_with_class_role"
+            source_pool = self.role_of_replica.get(replica, "unknown")
+            target_pool = cls
+
+        self._register(session_id, cls, replica)
+        return {
+            "event": "assign",
+            "time_s": time_s,
+            "session_id": session_id,
+            "class": cls,
+            "replica": replica,
+            "action": action,
+            "source_pool": source_pool,
+            "target_pool": target_pool,
+            "reason": reason,
+            "pool_sizes": self._alloc_counts(),
+            **self._assignment_metadata(replica),
+        }
+
+    def release_session(self, time_s: float, session_id: str) -> dict[str, Any] | None:
+        event = super().release_session(time_s, session_id)
+        self._maybe_run_controller(time_s)
+        return event
+
+
+class GlobalTargetRepairNoMixedBalancePolicy(GlobalTargetRepairNoMixedPolicy):
+    name = "global_target_repair_nomixed_balance"
+    config_key = "global_target_repair_nomixed_balance"
+
+    def _balance_cost(self, alloc: dict[str, int], demand: dict[str, int]) -> float:
+        return float(
+            sum(
+                self._pressure(alloc, demand, cls) ** 2
+                for cls in self._active_classes(demand)
+            )
+        )
+
+    def _target_alloc(self, current: dict[str, int], demand: dict[str, int]) -> dict[str, int]:
+        return min(
+            self._feasible_allocations(),
+            key=lambda alloc: (
+                self._inversion_cost(alloc, demand),
+                self._balance_cost(alloc, demand),
+                self._distance(alloc, current),
+                tuple(int(alloc[cls]) for cls in self.classes),
+            ),
+        )
+
+    def release_session(self, time_s: float, session_id: str) -> dict[str, Any] | None:
+        return BasePolicy.release_session(self, time_s, session_id)
+
+
+class GlobalTargetRepairV2NoMixedInit422Policy(GlobalTargetRepairNoMixedPolicy):
+    name = "global_target_repair_v2_nomixed_init_4_2_2"
+    config_key = "global_target_repair_v2_nomixed_init_4_2_2"
+
+    def _default_initial_alloc(self) -> dict[str, int]:
+        if self.nb_replicas == 8:
+            return {"enterprise": 4, "premium": 2, "freemium": 2}
+        return super()._default_initial_alloc()
+
+    def _balance_cost(self, alloc: dict[str, int], demand: dict[str, int]) -> float:
+        return float(
+            sum(
+                self._pressure(alloc, demand, cls) ** 2
+                for cls in self._active_classes(demand)
+            )
+        )
+
+    def _target_alloc(self, current: dict[str, int], demand: dict[str, int]) -> dict[str, int]:
+        return min(
+            self._feasible_allocations(),
+            key=lambda alloc: (
+                self._inversion_cost(alloc, demand),
+                self._balance_cost(alloc, demand),
+                self._distance(alloc, current),
+                tuple(int(alloc[cls]) for cls in self.classes),
+            ),
+        )
+
+    def _choose_zero_inversion_target_move(
+        self,
+        current: dict[str, int],
+        target: dict[str, int],
+        demand: dict[str, int],
+    ) -> tuple[str | None, str | None, str]:
+        current_distance = self._distance(current, target)
+
+        if current == target:
+            return None, None, "no_move_at_target"
+
+        for receiver in self.classes:
+            if current[receiver] >= target[receiver]:
+                continue
+
+            for donor in reversed(self.classes):
+                if donor == receiver:
+                    continue
+                if current[donor] <= target[donor]:
+                    continue
+                if current[donor] <= self.floors[donor]:
+                    continue
+
+                after = self._after_alloc(current, donor, receiver)
+                if self._inversion_cost(after, demand) != 0.0:
+                    continue
+                if self._distance(after, target) >= current_distance:
+                    continue
+
+                return donor, receiver, "neutral_move_toward_target"
+
+        return None, None, "no_safe_target_move"
+
+    def _run_controller(self, time_s: float) -> None:
+        current = self._alloc_counts()
+        demand = self._demand()
+        target = self._target_alloc(current, demand)
+        current_inv = self._inversion_cost(current, demand)
+
+        if current_inv > 0.0:
+            donor, receiver, reason = self._choose_repair_move(current, target)
+        else:
+            donor, receiver, reason = self._choose_zero_inversion_target_move(
+                current,
+                target,
+                demand,
+            )
+
+        moved_replica: int | str = ""
+        after = dict(current)
+
+        if donor is not None and receiver is not None:
+            replica = self._select_donor_replica(donor)
+            if replica is None:
+                reason = "no_physical_donor"
+            else:
+                self.role_of_replica[replica] = receiver
+                moved_replica = replica
+                after = self._after_alloc(current, donor, receiver)
+
+        self._record_control_decision(
+            time_s=time_s,
+            reason=reason,
+            move_from=donor or "",
+            move_to=receiver or "",
+            moved_replica=moved_replica,
+            current=current,
+            target=target,
+            after=after,
+            demand=demand,
+        )
+
+    def release_session(self, time_s: float, session_id: str) -> dict[str, Any] | None:
+        return BasePolicy.release_session(self, time_s, session_id)
+
+
+class GlobalTargetRepairV4Policy(GlobalTargetRepairNoMixedPolicy):
+    name = "global_target_repair_v4"
+    config_key = "global_target_repair_v4"
+
+    def _lowest_priority_pressure_key(
+        self,
+        alloc: dict[str, int],
+        demand: dict[str, int],
+    ) -> tuple[float, ...]:
+        return tuple(
+            self._pressure(alloc, demand, cls)
+            for cls in reversed(self.classes)
+        )
+
+    def _target_alloc(self, current: dict[str, int], demand: dict[str, int]) -> dict[str, int]:
+        return min(
+            self._feasible_allocations(),
+            key=lambda alloc: (
+                self._inversion_cost(alloc, demand),
+                self._lowest_priority_pressure_key(alloc, demand),
+                self._distance(alloc, current),
+                tuple(-int(alloc[cls]) for cls in self.classes),
+            ),
+        )
+
+
 class GlobalTargetRepairNeutralInit422Policy(GlobalTargetRepairNeutralPolicy):
     name = "global_target_repair_neutral_init_4_2_2"
     config_key = "global_target_repair_neutral_init_4_2_2"
@@ -780,6 +1313,10 @@ AVAILABLE_POLICIES = {
     "plb_nclass": PLBNClassPolicy,
     "global_target_repair_neutral": GlobalTargetRepairNeutralPolicy,
     "global_target_repair_target_only": GlobalTargetRepairTargetOnlyPolicy,
+    "global_target_repair_nomixed": GlobalTargetRepairNoMixedPolicy,
+    "global_target_repair_nomixed_balance": GlobalTargetRepairNoMixedBalancePolicy,
+    "global_target_repair_v2_nomixed_init_4_2_2": GlobalTargetRepairV2NoMixedInit422Policy,
+    "global_target_repair_v4": GlobalTargetRepairV4Policy,
     "global_target_repair_neutral_init_4_2_2": GlobalTargetRepairNeutralInit422Policy,
     "global_target_repair_target_only_init_4_2_2": GlobalTargetRepairTargetOnlyInit422Policy,
 }

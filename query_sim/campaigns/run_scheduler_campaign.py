@@ -30,6 +30,10 @@ DEFAULT_SCHEDULERS = [
     "plb_nclass",
     "global_target_repair_neutral",
     "global_target_repair_target_only",
+    "global_target_repair_nomixed",
+    "global_target_repair_nomixed_balance",
+    "global_target_repair_v2_nomixed_init_4_2_2",
+    "global_target_repair_v4",
     "global_target_repair_neutral_init_4_2_2",
     "global_target_repair_target_only_init_4_2_2",
 ]

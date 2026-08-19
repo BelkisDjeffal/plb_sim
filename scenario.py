@@ -50,9 +50,61 @@ SCENARIO = {
         "donor_policy": "load_first",
         "higher_borrow_mode": "safe_surplus",
         "return_policy": "simple",
+        "global_target_repair_nomixed": {
+            "control_period": 1.0,
+            "floors": {
+                "enterprise": 1,
+                "premium": 1,
+                "freemium": 1,
+            },
+            "initial_alloc": {
+                "enterprise": 4,
+                "premium": 3,
+                "freemium": 1,
+            },
+        },
+        "global_target_repair_v4": {
+            "control_period": 1.0,
+            "floors": {
+                "enterprise": 1,
+                "premium": 1,
+                "freemium": 1,
+            },
+            "initial_alloc": {
+                "enterprise": 4,
+                "premium": 3,
+                "freemium": 1,
+            },
+        },
+        "global_target_repair_nomixed_balance": {
+            "control_period": 1.0,
+            "floors": {
+                "enterprise": 1,
+                "premium": 1,
+                "freemium": 1,
+            },
+            "initial_alloc": {
+                "enterprise": 4,
+                "premium": 2,
+                "freemium": 2,
+            },
+        },
+        "global_target_repair_v2_nomixed_init_4_2_2": {
+            "control_period": 1.0,
+            "floors": {
+                "enterprise": 1,
+                "premium": 1,
+                "freemium": 1,
+            },
+            "initial_alloc": {
+                "enterprise": 4,
+                "premium": 2,
+                "freemium": 2,
+            },
+        },
     },
 
-    "schedulers": ["round_robin", "least_loaded", "static_partition", "plb_nclass", "global_target_repair_neutral", "global_target_repair_target_only", "global_target_repair_neutral_init_4_2_2", "global_target_repair_target_only_init_4_2_2"],
+    "schedulers": ["round_robin", "least_loaded", "static_partition", "plb_nclass", "global_target_repair_neutral", "global_target_repair_target_only", "global_target_repair_nomixed", "global_target_repair_v4", "global_target_repair_nomixed_balance", "global_target_repair_neutral_init_4_2_2", "global_target_repair_target_only_init_4_2_2"],
 
     "faults": {
         "enabled": False,
